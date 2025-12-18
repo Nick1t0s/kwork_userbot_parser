@@ -37,7 +37,7 @@
 
 4. **Установите зависимости**
    ```bash
-   pip install pyrogram tgcrypto
+   pip install -r requirements.txt
    ```
 
 ### Подготовка к использованию
