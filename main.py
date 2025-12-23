@@ -20,8 +20,6 @@ class ChatAnalyzer:
         self.client = Client(session_name, api_id=api_id, api_hash=api_hash)
         self.db_conn = None
         self.chat_id = None
-        self.start_date = None
-        self.end_date = None
 
     def init_db(self, db_path: str):
         """Инициализирует SQLite базу данных"""
@@ -53,14 +51,6 @@ class ChatAnalyzer:
 
         self.db_conn.commit()
 
-    def parse_date(self, date_str: str) -> datetime:
-        """Парсит дату в формате день.месяц.год и возвращает datetime с UTC временной зоной"""
-        try:
-            day, month, year = map(int, date_str.split('.'))
-            return datetime(year, month, day, tzinfo=timezone.utc)
-        except ValueError:
-            raise ValueError(f"Некорректный формат даты: {date_str}. Используйте формат: день.месяц.год")
-
     async def fetch_messages(self):
         """Собирает все сообщения из выбранного чата"""
         print("Начинаю загрузку сообщений...")
@@ -73,62 +63,34 @@ class ChatAnalyzer:
             return
 
         count = 0
-        batch_count = 0
-        batch_size = 100  # Размер батча для коммита в БД
+        batch_size = 100  # Уменьшаем размер батча для лучшей стабильности
 
         try:
-            async for message in self.client.get_chat_history(self.chat_id):
-                # В Pyrogram 2.x+ message.date уже является объектом datetime с часовым поясом
-                message_date = message.date
-
-                # Приводим к UTC если необходимо
-                if message_date.tzinfo is None:
-                    message_date = message_date.replace(tzinfo=timezone.utc)
-                else:
-                    message_date = message_date.astimezone(timezone.utc)
-
-                # Если указан период, проверяем вхождение в диапазон
-                if self.start_date and message_date < self.start_date:
-                    continue  # Пропускаем сообщения до начала периода
-                if self.end_date and message_date > self.end_date:
-                    continue  # Пропускаем сообщения после окончания периода
-
+            # Используем асинхронный генератор напрямую
+            async for message in self.client.get_chat_history(self.chat_id, limit=0):
                 self._save_message(message)
                 count += 1
-                batch_count += 1
 
-                if batch_count >= batch_size:
+                if count % 1000 == 0:
                     print(f"Загружено {count} сообщений...")
                     self.db_conn.commit()  # Регулярно сохраняем данные
-                    batch_count = 0
 
-                    # Делаем небольшую паузу для избежания флуд-ограничений
+                # Делаем небольшую паузу для избежания флуд-ограничений
+                if count % 100 == 0:
                     await asyncio.sleep(0.1)
-
-            # Финальный коммит
-            self.db_conn.commit()
-            print(f"Всего загружено {count} сообщений")
-
         except FloodWait as e:
             print(f"Получен FloodWait: ждем {e.x} секунд")
             await asyncio.sleep(e.x)
         except Exception as e:
             print(f"Ошибка при загрузке сообщений: {e}")
-            import traceback
-            traceback.print_exc()
 
+        self.db_conn.commit()
+        print(f"Всего загружено {count} сообщений")
 
     def _save_message(self, message: Message):
         """Сохраняет сообщение в базу данных"""
         cursor = self.db_conn.cursor()
         text = message.text or message.caption
-
-        # Определение типа медиа
-        media_type = None
-        emoji = None
-        file_id = None
-        set_name = None
-
         if message.sticker:
             media_type = "sticker"
             emoji = message.sticker.emoji
@@ -136,26 +98,35 @@ class ChatAnalyzer:
             set_name = message.sticker.set_name
         elif message.photo:
             media_type = "photo"
+            emoji = None
             file_id = message.photo.file_id
+            set_name = None
         elif message.video:
             media_type = "video"
+            emoji = None
             file_id = message.video.file_id
+            set_name = None
         elif message.voice:
             media_type = "voice"
+            emoji = None
             file_id = message.voice.file_id
+            set_name = None
         elif message.video_note:
             media_type = "video_note"
+            emoji = None
             file_id = message.video_note.file_id
-
-        # В Pyrogram 2.x+ message.date уже является объектом datetime
-        # Приводим к UTC и преобразуем в ISO формат
-        message_date = message.date.astimezone(timezone.utc).isoformat()
+            set_name = None
+        else:
+            media_type = None
+            emoji = None
+            file_id = None
+            set_name = None
 
         cursor.execute(
             "INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 message.id,
-                message_date,  # Используем преобразованную дату
+                message.date.isoformat(),
                 message.from_user.id if message.from_user else None,
                 message.from_user.username if message.from_user else None,
                 message.from_user.first_name if message.from_user else None,
@@ -217,8 +188,8 @@ class ChatAnalyzer:
                 sticker_pack_link = None
             detailed_top_stickers.append((emoji, count, set_name, sticker_pack_link))
 
-        # 4. Самый активный день (учитываем только текстовые сообщения, без фото и видео)
-        cursor.execute("SELECT date FROM messages WHERE date IS NOT NULL AND media_type NOT IN ('photo', 'video')")
+        # 4. Самый активный день (с учетом часового пояса)
+        cursor.execute("SELECT date FROM messages WHERE date IS NOT NULL")
         dates = [datetime.fromisoformat(row[0]).astimezone(timezone.utc).date() for row in cursor.fetchall()]
         active_day = Counter(dates).most_common(1)[0] if dates else (None, 0)
 
@@ -384,10 +355,8 @@ class ChatAnalyzer:
         else:
             top_user_sticker = (None, 0, None, None)
 
-        # 4. Самый активный день (учитываем только текстовые сообщения, без фото и видео)
-        cursor.execute(
-            "SELECT date FROM messages WHERE sender_id = ? AND date IS NOT NULL AND media_type NOT IN ('photo', 'video')",
-            (user_id,))
+        # 4. Самый активный день (с учетом часового пояса)
+        cursor.execute("SELECT date FROM messages WHERE sender_id = ? AND date IS NOT NULL", (user_id,))
         user_dates = [datetime.fromisoformat(row[0]).astimezone(timezone.utc).date() for row in cursor.fetchall()]
         active_user_day = Counter(user_dates).most_common(1)[0] if user_dates else (None, 0)
 
@@ -429,20 +398,6 @@ class ChatAnalyzer:
     def export_results(self, global_stats: Dict, user_stats: Dict[str, Dict], output_file: str):
         """Экспортирует результаты в текстовый файл"""
         with open(output_file, 'w', encoding='utf-8') as f:
-            # Добавляем информацию о периоде анализа
-            if self.start_date and self.end_date:
-                start_str = self.start_date.strftime("%d.%m.%Y")
-                end_str = self.end_date.strftime("%d.%m.%Y")
-                f.write(f"=== АНАЛИЗ ЗА ПЕРИОД: {start_str} - {end_str} ===\n\n")
-            elif self.start_date:
-                start_str = self.start_date.strftime("%d.%m.%Y")
-                f.write(f"=== АНАЛИЗ С {start_str} ===\n\n")
-            elif self.end_date:
-                end_str = self.end_date.strftime("%d.%m.%Y")
-                f.write(f"=== АНАЛИЗ ДО {end_str} ===\n\n")
-            else:
-                f.write("=== АНАЛИЗ ЗА ВСЕ ВРЕМЯ ===\n\n")
-
             f.write("=== ГЛОБАЛЬНАЯ СТАТИСТИКА ===\n\n")
 
             f.write(f"1. Всего сообщений: {global_stats['total_messages']}\n\n")
@@ -464,7 +419,7 @@ class ChatAnalyzer:
             f.write("\n")
 
             f.write(
-                f"4. Самый активный день (без фото и видео): {global_stats['active_day'][0]} ({global_stats['active_day'][1]} сообщений)\n\n")
+                f"4. Самый активный день: {global_stats['active_day'][0]} ({global_stats['active_day'][1]} сообщений)\n\n")
 
             f.write(f"5. Дней без активности: {global_stats['inactive_days']}\n\n")
 
@@ -523,8 +478,7 @@ class ChatAnalyzer:
                 else:
                     f.write("3. Самый популярный стикер: Не найдено\n")
 
-                f.write(
-                    f"4. Самый активный день (без фото и видео): {stats['active_day'][0]} ({stats['active_day'][1]} сообщений)\n")
+                f.write(f"4. Самый активный день: {stats['active_day'][0]} ({stats['active_day'][1]} сообщений)\n")
 
                 f.write(f"5. Дней без активности: {stats['inactive_days']}\n")
 
@@ -620,36 +574,6 @@ class ChatAnalyzer:
             except ValueError:
                 print("Некорректный ID чата. Пожалуйста, введите целое число.")
 
-        # Запрашиваем период анализа
-        print("\nВведите период анализа (формат: день.месяц.год)")
-        print("Например: 1.1.2023 (для 1 января 2023 года)")
-        print("Оставьте пустым, чтобы проанализировать все сообщения")
-
-        start_input = input("Начальная дата (день.месяц.год): ").strip()
-        end_input = input("Конечная дата (день.месяц.год): ").strip()
-
-        if start_input:
-            try:
-                self.start_date = self.parse_date(start_input)
-            except ValueError as e:
-                print(f"Ошибка: {e}")
-                return
-        else:
-            self.start_date = None
-
-        if end_input:
-            try:
-                self.end_date = self.parse_date(end_input)
-                # Проверяем корректность диапазона
-                if self.start_date and self.end_date < self.start_date:
-                    print("Ошибка: конечная дата не может быть раньше начальной")
-                    return
-            except ValueError as e:
-                print(f"Ошибка: {e}")
-                return
-        else:
-            self.end_date = None
-
         # Проверяем доступ к чату
         try:
             await self.client.get_chat(self.chat_id)
@@ -682,32 +606,9 @@ class ChatAnalyzer:
 
         print(f"Анализ завершен. Результаты сохранены в {output_file}")
 
-    async def run_with_args(self, chat_id: int, start_date: str, end_date: str, db_path: str, output_file: str):
+    async def run_with_args(self, chat_id: int, db_path: str, output_file: str):
         """Запуск с аргументами командной строки"""
         await self.client.start()
-
-        # Парсим даты
-        if start_date:
-            try:
-                self.start_date = self.parse_date(start_date)
-            except ValueError as e:
-                print(f"Ошибка: {e}")
-                return
-        else:
-            self.start_date = None
-
-        if end_date:
-            try:
-                self.end_date = self.parse_date(end_date)
-                # Проверяем корректность диапазона
-                if self.start_date and self.end_date < self.start_date:
-                    print("Ошибка: конечная дата не может быть раньше начальной")
-                    return
-            except ValueError as e:
-                print(f"Ошибка: {e}")
-                return
-        else:
-            self.end_date = None
 
         # Проверяем доступ к чату
         try:
@@ -745,8 +646,6 @@ def main():
     load_dotenv(".env")
     parser = argparse.ArgumentParser(description="Telegram Chat Analyzer Userbot")
     parser.add_argument("--chat_id", type=int, help="ID чата для анализа")
-    parser.add_argument("--start_date", type=str, help="Начальная дата в формате день.месяц.год (например: 1.1.2023)")
-    parser.add_argument("--end_date", type=str, help="Конечная дата в формате день.месяц.год (например: 31.12.2023)")
     parser.add_argument("--db_path", type=str, default="chat_data.db", help="Путь к базе данных")
     parser.add_argument("--output", type=str, default="results.txt", help="Файл для вывода результатов")
 
@@ -767,7 +666,7 @@ def main():
     if not args.chat_id:
         asyncio.run(analyzer.run_interactive())
     else:
-        asyncio.run(analyzer.run_with_args(args.chat_id, args.start_date, args.end_date, args.db_path, args.output))
+        asyncio.run(analyzer.run_with_args(args.chat_id, args.db_path, args.output))
 
 
 if __name__ == "__main__":
