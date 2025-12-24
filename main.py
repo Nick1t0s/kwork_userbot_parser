@@ -20,6 +20,25 @@ class ChatAnalyzer:
         self.client = Client(session_name, api_id=api_id, api_hash=api_hash)
         self.db_conn = None
         self.chat_id = None
+        self.start_date = None
+        self.end_date = None
+
+    def _get_date_filter_query(self, base_query: str) -> Tuple[str, list]:
+        """Добавляет условия фильтрации по датам к SQL запросу"""
+        params = []
+        query = base_query
+
+        if self.start_date:
+            query += " AND date >= ?"
+            params.append(self.start_date.isoformat())
+
+        if self.end_date:
+            # Добавляем 1 день, чтобы включить все сообщения последнего дня
+            end_date_inclusive = self.end_date + timedelta(days=1)
+            query += " AND date < ?"
+            params.append(end_date_inclusive.isoformat())
+
+        return query, params
 
     def init_db(self, db_path: str):
         """Инициализирует SQLite базу данных"""
@@ -51,6 +70,14 @@ class ChatAnalyzer:
 
         self.db_conn.commit()
 
+    def parse_date(self, date_str: str) -> datetime:
+        """Парсит дату в формате день.месяц.год и возвращает datetime с UTC временной зоной"""
+        try:
+            day, month, year = map(int, date_str.split('.'))
+            return datetime(year, month, day, tzinfo=timezone.utc)
+        except ValueError:
+            raise ValueError(f"Некорректный формат даты: {date_str}. Используйте формат: день.месяц.год")
+
     async def fetch_messages(self):
         """Собирает все сообщения из выбранного чата"""
         print("Начинаю загрузку сообщений...")
@@ -63,34 +90,62 @@ class ChatAnalyzer:
             return
 
         count = 0
-        batch_size = 100  # Уменьшаем размер батча для лучшей стабильности
+        batch_count = 0
+        batch_size = 100  # Размер батча для коммита в БД
 
         try:
-            # Используем асинхронный генератор напрямую
-            async for message in self.client.get_chat_history(self.chat_id, limit=0):
+            async for message in self.client.get_chat_history(self.chat_id):
+                # В Pyrogram 2.x+ message.date уже является объектом datetime с часовым поясом
+                message_date = message.date
+
+                # Приводим к UTC если необходимо
+                if message_date.tzinfo is None:
+                    message_date = message_date.replace(tzinfo=timezone.utc)
+                else:
+                    message_date = message_date.astimezone(timezone.utc)
+
+                # Если указан период, проверяем вхождение в диапазон
+                if self.start_date and message_date < self.start_date:
+                    continue  # Пропускаем сообщения до начала периода
+                if self.end_date and message_date > self.end_date:
+                    continue  # Пропускаем сообщения после окончания периода
+
                 self._save_message(message)
                 count += 1
+                batch_count += 1
 
-                if count % 1000 == 0:
+                if batch_count >= batch_size:
                     print(f"Загружено {count} сообщений...")
                     self.db_conn.commit()  # Регулярно сохраняем данные
+                    batch_count = 0
 
-                # Делаем небольшую паузу для избежания флуд-ограничений
-                if count % 100 == 0:
+                    # Делаем небольшую паузу для избежания флуд-ограничений
                     await asyncio.sleep(0.1)
+
+            # Финальный коммит
+            self.db_conn.commit()
+            print(f"Всего загружено {count} сообщений")
+
         except FloodWait as e:
             print(f"Получен FloodWait: ждем {e.x} секунд")
             await asyncio.sleep(e.x)
         except Exception as e:
             print(f"Ошибка при загрузке сообщений: {e}")
+            import traceback
+            traceback.print_exc()
 
-        self.db_conn.commit()
-        print(f"Всего загружено {count} сообщений")
 
     def _save_message(self, message: Message):
         """Сохраняет сообщение в базу данных"""
         cursor = self.db_conn.cursor()
         text = message.text or message.caption
+
+        # Определение типа медиа
+        media_type = None
+        emoji = None
+        file_id = None
+        set_name = None
+
         if message.sticker:
             media_type = "sticker"
             emoji = message.sticker.emoji
@@ -98,35 +153,26 @@ class ChatAnalyzer:
             set_name = message.sticker.set_name
         elif message.photo:
             media_type = "photo"
-            emoji = None
             file_id = message.photo.file_id
-            set_name = None
         elif message.video:
             media_type = "video"
-            emoji = None
             file_id = message.video.file_id
-            set_name = None
         elif message.voice:
             media_type = "voice"
-            emoji = None
             file_id = message.voice.file_id
-            set_name = None
         elif message.video_note:
             media_type = "video_note"
-            emoji = None
             file_id = message.video_note.file_id
-            set_name = None
-        else:
-            media_type = None
-            emoji = None
-            file_id = None
-            set_name = None
+
+        # В Pyrogram 2.x+ message.date уже является объектом datetime
+        # Приводим к UTC и преобразуем в ISO формат
+        message_date = message.date.astimezone(timezone.utc).isoformat()
 
         cursor.execute(
             "INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 message.id,
-                message.date.isoformat(),
+                message_date,  # Используем преобразованную дату
                 message.from_user.id if message.from_user else None,
                 message.from_user.username if message.from_user else None,
                 message.from_user.first_name if message.from_user else None,
@@ -143,12 +189,16 @@ class ChatAnalyzer:
         """Анализирует глобальную статистику чата"""
         cursor = self.db_conn.cursor()
 
-        # 1. Всего сообщений
-        cursor.execute("SELECT COUNT(*) FROM messages")
+        # 1. Всего сообщений (с фильтрацией по периоду)
+        query = "SELECT COUNT(*) FROM messages WHERE 1=1"
+        query, params = self._get_date_filter_query(query)
+        cursor.execute(query, params)
         total_messages = cursor.fetchone()[0]
 
-        # 2. Топ-10 самых популярных слов (с фильтрацией стоп-слов)
-        cursor.execute("SELECT text FROM messages WHERE text IS NOT NULL")
+        # 2. Топ-10 самых популярных слов (с фильтрацией по периоду)
+        query = "SELECT text FROM messages WHERE text IS NOT NULL"
+        query, params = self._get_date_filter_query(query)
+        cursor.execute(query, params)
         all_texts = [row[0] for row in cursor.fetchall()]
         words = []
         stop_words = {
@@ -168,8 +218,10 @@ class ChatAnalyzer:
 
         top_words = Counter(words).most_common(10)
 
-        # 3. Топ-5 самых популярных стикеров (по эмодзи, а не file_id)
-        cursor.execute("SELECT sticker_emoji, sticker_set_name FROM messages WHERE sticker_emoji IS NOT NULL")
+        # 3. Топ-5 самых популярных стикеров (по эмодзи, а не file_id) с фильтрацией по периоду
+        query = "SELECT sticker_emoji, sticker_set_name FROM messages WHERE sticker_emoji IS NOT NULL"
+        query, params = self._get_date_filter_query(query)
+        cursor.execute(query, params)
         sticker_data = [(row[0], row[1]) for row in cursor.fetchall() if row[0]]
         sticker_emojis = [row[0] for row in sticker_data]
         top_stickers = Counter(sticker_emojis).most_common(5)
@@ -177,8 +229,12 @@ class ChatAnalyzer:
         # Получаем дополнительную информацию о топ-стикерах
         detailed_top_stickers = []
         for emoji, count in top_stickers:
-            # Получаем имя стикерпака для этого эмодзи
-            cursor.execute("SELECT sticker_set_name FROM messages WHERE sticker_emoji = ? LIMIT 1", (emoji,))
+            # Получаем имя стикерпака для этого эмодзи (с фильтрацией по периоду)
+            query = "SELECT sticker_set_name FROM messages WHERE sticker_emoji = ?"
+            query, params = self._get_date_filter_query(query)
+            query += "LIMIT 1"
+            params = [emoji] + params
+            cursor.execute(query, params)
             result = cursor.fetchone()
             if result and result[0]:
                 set_name = result[0]
@@ -188,9 +244,20 @@ class ChatAnalyzer:
                 sticker_pack_link = None
             detailed_top_stickers.append((emoji, count, set_name, sticker_pack_link))
 
-        # 4. Самый активный день (с учетом часового пояса)
-        cursor.execute("SELECT date FROM messages WHERE date IS NOT NULL")
-        dates = [datetime.fromisoformat(row[0]).astimezone(timezone.utc).date() for row in cursor.fetchall()]
+        # 4. Самый активный день (учитываем только текстовые сообщения, без фото и видео) с фильтрацией
+        query = "SELECT date FROM messages WHERE date IS NOT NULL AND media_type NOT IN ('photo', 'video')"
+        query, params = self._get_date_filter_query(query)
+        cursor.execute(query, params)
+        # ИСПРАВЛЕНО: теперь правильно парсим дату из ISO строки
+        date_strings = [row[0] for row in cursor.fetchall()]
+        dates = []
+        for dt_str in date_strings:
+            try:
+                dt = datetime.fromisoformat(dt_str).astimezone(timezone.utc)
+                dates.append(dt.date())
+            except ValueError:
+                # Пропускаем некорректные строки дат
+                continue
         active_day = Counter(dates).most_common(1)[0] if dates else (None, 0)
 
         # 5. Дней без активности (учитываем весь период от первого до последнего сообщения)
@@ -203,29 +270,52 @@ class ChatAnalyzer:
         else:
             inactive_days = 0
 
-        # 6. Общее количество голосовых/кружочков
-        cursor.execute("SELECT COUNT(*) FROM messages WHERE media_type IN ('voice', 'video_note')")
+        # 6. Общее количество голосовых/кружочков с фильтрацией
+        query = "SELECT COUNT(*) FROM messages WHERE media_type IN ('voice', 'video_note')"
+        query, params = self._get_date_filter_query(query)
+        cursor.execute(query, params)
         voice_count = cursor.fetchone()[0]
 
-        # 7. Самый активный участник по сообщениям (по ID, а не по имени)
-        cursor.execute(
-            "SELECT sender_id, sender_first_name, COUNT(*) FROM messages WHERE sender_id IS NOT NULL GROUP BY sender_id ORDER BY COUNT(*) DESC LIMIT 1")
+        # 7. Самый активный участник по сообщениям (по ID, а не по имени) с фильтрацией
+        query = """
+            SELECT sender_id, sender_first_name, COUNT(*) 
+            FROM messages 
+            WHERE sender_id IS NOT NULL
+        """
+        query, params = self._get_date_filter_query(query)
+        query += " GROUP BY sender_id ORDER BY COUNT(*) DESC LIMIT 1"
+        cursor.execute(query, params)
         top_sender = cursor.fetchone()
 
-        # 8. Самый активный по голосовым (по ID)
-        cursor.execute(
-            "SELECT sender_id, sender_first_name, COUNT(*) FROM messages WHERE sender_id IS NOT NULL AND media_type IN ('voice', 'video_note') GROUP BY sender_id ORDER BY COUNT(*) DESC LIMIT 1")
+        # 8. Самый активный по голосовым (по ID) с фильтрацией
+        query = """
+            SELECT sender_id, sender_first_name, COUNT(*) 
+            FROM messages 
+            WHERE sender_id IS NOT NULL AND media_type IN ('voice', 'video_note')
+        """
+        query, params = self._get_date_filter_query(query)
+        query += " GROUP BY sender_id ORDER BY COUNT(*) DESC LIMIT 1"
+        cursor.execute(query, params)
         top_voice_sender = cursor.fetchone()
 
-        # 9. Самый активный по фото/видео (по ID)
-        cursor.execute(
-            "SELECT sender_id, sender_first_name, COUNT(*) FROM messages WHERE sender_id IS NOT NULL AND media_type IN ('photo', 'video') GROUP BY sender_id ORDER BY COUNT(*) DESC LIMIT 1")
+        # 9. Самый активный по фото/видео (по ID) с фильтрацией
+        query = """
+            SELECT sender_id, sender_first_name, COUNT(*) 
+            FROM messages 
+            WHERE sender_id IS NOT NULL AND media_type IN ('photo', 'video')
+        """
+        query, params = self._get_date_filter_query(query)
+        query += " GROUP BY sender_id ORDER BY COUNT(*) DESC LIMIT 1"
+        cursor.execute(query, params)
         top_media_sender = cursor.fetchone()
 
-        # 10. Самый активный по словам (по ID)
+        # 10. Самый активный по словам (по ID) с фильтрацией
         word_counts = defaultdict(int)
-        for text, user_id in cursor.execute(
-                "SELECT text, sender_id FROM messages WHERE text IS NOT NULL AND sender_id IS NOT NULL"):
+        query = "SELECT text, sender_id FROM messages WHERE text IS NOT NULL AND sender_id IS NOT NULL"
+        query, params = self._get_date_filter_query(query)
+        cursor.execute(query, params)
+
+        for text, user_id in cursor.fetchall():
             if user_id and text:
                 # Учитываем только слова длиной >= 2 и не входящие в стоп-слова
                 text_words = re.findall(r'\b\w{2,}\b', text.lower())
@@ -233,33 +323,57 @@ class ChatAnalyzer:
                 word_counts[user_id] += len(filtered_words)
         top_wordy_sender = max(word_counts.items(), key=lambda x: x[1]) if word_counts else (None, 0)
 
-        # 11. Самый активный по стикерам (по ID)
-        cursor.execute(
-            "SELECT sender_id, sender_first_name, COUNT(*) FROM messages WHERE sender_id IS NOT NULL AND sticker_emoji IS NOT NULL GROUP BY sender_id ORDER BY COUNT(*) DESC LIMIT 1")
+        # 11. Самый активный по стикерам (по ID) с фильтрацией
+        query = """
+            SELECT sender_id, sender_first_name, COUNT(*) 
+            FROM messages 
+            WHERE sender_id IS NOT NULL AND sticker_emoji IS NOT NULL
+        """
+        query, params = self._get_date_filter_query(query)
+        query += " GROUP BY sender_id ORDER BY COUNT(*) DESC LIMIT 1"
+        cursor.execute(query, params)
         top_sticker_sender = cursor.fetchone()
 
-        # 12. Месяцы по активности
+        # 12. Месяцы по активности (с фильтрацией по периоду)
         month_activity = defaultdict(int)
-        for dt_str in [row[0] for row in cursor.execute("SELECT date FROM messages WHERE date IS NOT NULL")]:
-            dt = datetime.fromisoformat(dt_str).astimezone(timezone.utc)
-            month = dt.strftime('%Y-%m')
-            month_activity[month] += 1
+        query = "SELECT date FROM messages WHERE date IS NOT NULL"
+        query, params = self._get_date_filter_query(query)
+        cursor.execute(query, params)
+
+        # ИСПРАВЛЕНО: теперь правильно парсим дату из ISO строки
+        date_strings = [row[0] for row in cursor.fetchall()]
+        for dt_str in date_strings:
+            try:
+                dt = datetime.fromisoformat(dt_str).astimezone(timezone.utc)
+                month = dt.strftime('%Y-%m')
+                month_activity[month] += 1
+            except ValueError:
+                # Пропускаем некорректные строки дат
+                continue
         monthly_ranking = sorted(month_activity.items(), key=lambda x: x[1], reverse=True)
 
-        # 13. Популярные слова по месяцам
+        # 13. Популярные слова по месяцам (только для месяцев в выбранном периоде)
         monthly_top_words = {}
         for month in month_activity.keys():
-            start = f"{month}-01T00:00:00"
-            # Вычисляем следующий месяц
+            # Вычисляем диапазон дат для месяца
             year, mon = map(int, month.split('-'))
+            month_start = datetime(year, mon, 1, tzinfo=timezone.utc).isoformat()
+
+            # Следующий месяц
             if mon == 12:
-                next_month = f"{year + 1}-01-01T00:00:00"
+                next_month_start = datetime(year + 1, 1, 1, tzinfo=timezone.utc).isoformat()
             else:
-                next_month = f"{year}-{mon + 1:02d}-01T00:00:00"
-            cursor.execute("""
+                next_month_start = datetime(year, mon + 1, 1, tzinfo=timezone.utc).isoformat()
+
+            # Запрос с фильтрацией по периоду И по месяцу
+            base_query = """
                 SELECT text FROM messages 
                 WHERE date >= ? AND date < ?
-            """, (f"{month}-01T00:00:00", next_month))
+            """
+            query, params = self._get_date_filter_query(base_query)
+            params = [month_start, next_month_start] + params
+
+            cursor.execute(query, params)
             texts = [row[0] for row in cursor.fetchall() if row[0]]
             all_month_words = []
             for text in texts:
@@ -271,19 +385,25 @@ class ChatAnalyzer:
             if all_month_words:
                 monthly_top_words[month] = Counter(all_month_words).most_common(1)[0][0]
 
-        # 14. Самые активные участники по месяцам
+        # 14. Самые активные участники по месяцам (с фильтрацией)
         monthly_top_senders = {}
         for month in month_activity.keys():
             year, mon = map(int, month.split('-'))
+            month_start = datetime(year, mon, 1, tzinfo=timezone.utc).isoformat()
+
             if mon == 12:
-                next_month = f"{year + 1}-01-01T00:00:00"
+                next_month_start = datetime(year + 1, 1, 1, tzinfo=timezone.utc).isoformat()
             else:
-                next_month = f"{year}-{mon + 1:02d}-01T00:00:00"
-            cursor.execute("""
+                next_month_start = datetime(year, mon + 1, 1, tzinfo=timezone.utc).isoformat()
+
+            base_query = """
                 SELECT sender_id, sender_first_name, COUNT(*) FROM messages 
                 WHERE date >= ? AND date < ? AND sender_id IS NOT NULL
-                GROUP BY sender_id ORDER BY COUNT(*) DESC LIMIT 1
-            """, (f"{month}-01T00:00:00", next_month))
+            """
+            query, params = self._get_date_filter_query(base_query)
+            query+="GROUP BY sender_id ORDER BY COUNT(*) DESC LIMIT 1"
+            params = [month_start, next_month_start] + params
+            cursor.execute(query, params)
             result = cursor.fetchone()
             monthly_top_senders[month] = (result[1] if result else None, result[0] if result else None)  # (имя, id)
 
@@ -308,12 +428,20 @@ class ChatAnalyzer:
         """Анализирует статистику конкретного пользователя"""
         cursor = self.db_conn.cursor()
 
-        # 1. Всего сообщений
-        cursor.execute("SELECT COUNT(*) FROM messages WHERE sender_id = ?", (user_id,))
+        # 1. Всего сообщений (с фильтрацией по периоду)
+        query = "SELECT COUNT(*) FROM messages WHERE sender_id = ?"
+        params = [user_id]
+        query, date_params = self._get_date_filter_query(query)
+        params = params + date_params
+        cursor.execute(query, params)
         total_messages = cursor.fetchone()[0]
 
-        # 2. Топ-10 слов (с фильтрацией стоп-слов)
-        cursor.execute("SELECT text FROM messages WHERE sender_id = ? AND text IS NOT NULL", (user_id,))
+        # 2. Топ-10 слов (с фильтрацией по периоду)
+        query = "SELECT text FROM messages WHERE sender_id = ? AND text IS NOT NULL"
+        params = [user_id]
+        query, date_params = self._get_date_filter_query(query)
+        params = params + date_params
+        cursor.execute(query, params)
         user_texts = [row[0] for row in cursor.fetchall() if row[0]]
         all_user_words = []
         stop_words = {
@@ -333,17 +461,22 @@ class ChatAnalyzer:
                 all_user_words.extend(filtered_words)
         top_user_words = Counter(all_user_words).most_common(10)
 
-        # 3. Самый популярный стикер (по эмодзи, а не file_id)
-        cursor.execute(
-            "SELECT sticker_emoji, sticker_set_name FROM messages WHERE sender_id = ? AND sticker_emoji IS NOT NULL",
-            (user_id,))
+        # 3. Самый популярный стикер (по эмодзи, а не file_id) с фильтрацией
+        query = "SELECT sticker_emoji, sticker_set_name FROM messages WHERE sender_id = ? AND sticker_emoji IS NOT NULL"
+        params = [user_id]
+        query, date_params = self._get_date_filter_query(query)
+        params = params + date_params
+        cursor.execute(query, params)
         user_sticker_data = [(row[0], row[1]) for row in cursor.fetchall() if row[0]]
         user_stickers = [row[0] for row in user_sticker_data]
         if user_stickers:
             top_user_sticker_emoji = Counter(user_stickers).most_common(1)[0]
-            # Получаем имя стикерпака для этого эмодзи
-            cursor.execute("SELECT sticker_set_name FROM messages WHERE sender_id = ? AND sticker_emoji = ? LIMIT 1",
-                           (user_id, top_user_sticker_emoji[0]))
+            # Получаем имя стикерпака для этого эмодзи (с фильтрацией)
+            query = "SELECT sticker_set_name FROM messages WHERE sender_id = ? AND sticker_emoji = ?"
+            params = [user_id, top_user_sticker_emoji[0]]
+            query, date_params = self._get_date_filter_query(query)
+            params = params + date_params
+            cursor.execute(query, params)
             result = cursor.fetchone()
             if result and result[0]:
                 set_name = result[0]
@@ -355,9 +488,22 @@ class ChatAnalyzer:
         else:
             top_user_sticker = (None, 0, None, None)
 
-        # 4. Самый активный день (с учетом часового пояса)
-        cursor.execute("SELECT date FROM messages WHERE sender_id = ? AND date IS NOT NULL", (user_id,))
-        user_dates = [datetime.fromisoformat(row[0]).astimezone(timezone.utc).date() for row in cursor.fetchall()]
+        # 4. Самый активный день (учитываем только текстовые сообщения, без фото и видео) с фильтрацией
+        query = "SELECT date FROM messages WHERE sender_id = ? AND date IS NOT NULL AND media_type NOT IN ('photo', 'video')"
+        params = [user_id]
+        query, date_params = self._get_date_filter_query(query)
+        params = params + date_params
+        cursor.execute(query, params)
+        # ИСПРАВЛЕНО: теперь правильно парсим дату из ISO строки
+        date_strings = [row[0] for row in cursor.fetchall()]
+        user_dates = []
+        for dt_str in date_strings:
+            try:
+                dt = datetime.fromisoformat(dt_str).astimezone(timezone.utc)
+                user_dates.append(dt.date())
+            except ValueError:
+                # Пропускаем некорректные строки дат
+                continue
         active_user_day = Counter(user_dates).most_common(1)[0] if user_dates else (None, 0)
 
         # 5. Дней без активности (в рамках общего периода)
@@ -370,19 +516,32 @@ class ChatAnalyzer:
         else:
             inactive_days = 0
 
-        # 6. Количество голосовых
-        cursor.execute("SELECT COUNT(*) FROM messages WHERE sender_id = ? AND media_type IN ('voice', 'video_note')",
-                       (user_id,))
+        # 6. Количество голосовых с фильтрацией
+        query = "SELECT COUNT(*) FROM messages WHERE sender_id = ? AND media_type IN ('voice', 'video_note')"
+        params = [user_id]
+        query, date_params = self._get_date_filter_query(query)
+        params = params + date_params
+        cursor.execute(query, params)
         user_voice_count = cursor.fetchone()[0]
 
-        # 7. Месяцы по активности
+        # 7. Месяцы по активности (с фильтрацией)
         user_month_activity = defaultdict(int)
-        for dt_str in [row[0] for row in
-                       cursor.execute("SELECT date FROM messages WHERE sender_id = ? AND date IS NOT NULL",
-                                      (user_id,))]:
-            dt = datetime.fromisoformat(dt_str).astimezone(timezone.utc)
-            month = dt.strftime('%Y-%m')
-            user_month_activity[month] += 1
+        query = "SELECT date FROM messages WHERE sender_id = ? AND date IS NOT NULL"
+        params = [user_id]
+        query, date_params = self._get_date_filter_query(query)
+        params = params + date_params
+        cursor.execute(query, params)
+
+        # ИСПРАВЛЕНО: теперь правильно парсим дату из ISO строки
+        date_strings = [row[0] for row in cursor.fetchall()]
+        for dt_str in date_strings:
+            try:
+                dt = datetime.fromisoformat(dt_str).astimezone(timezone.utc)
+                month = dt.strftime('%Y-%m')
+                user_month_activity[month] += 1
+            except ValueError:
+                # Пропускаем некорректные строки дат
+                continue
         user_monthly_ranking = sorted(user_month_activity.items(), key=lambda x: x[1], reverse=True)
 
         return {
@@ -394,10 +553,23 @@ class ChatAnalyzer:
             "voice_count": user_voice_count,
             "monthly_ranking": user_monthly_ranking
         }
-
     def export_results(self, global_stats: Dict, user_stats: Dict[str, Dict], output_file: str):
         """Экспортирует результаты в текстовый файл"""
         with open(output_file, 'w', encoding='utf-8') as f:
+            # Добавляем информацию о периоде анализа
+            if self.start_date and self.end_date:
+                start_str = self.start_date.strftime("%d.%m.%Y")
+                end_str = self.end_date.strftime("%d.%m.%Y")
+                f.write(f"=== АНАЛИЗ ЗА ПЕРИОД: {start_str} - {end_str} ===\n\n")
+            elif self.start_date:
+                start_str = self.start_date.strftime("%d.%m.%Y")
+                f.write(f"=== АНАЛИЗ С {start_str} ===\n\n")
+            elif self.end_date:
+                end_str = self.end_date.strftime("%d.%m.%Y")
+                f.write(f"=== АНАЛИЗ ДО {end_str} ===\n\n")
+            else:
+                f.write("=== АНАЛИЗ ЗА ВСЕ ВРЕМЯ ===\n\n")
+
             f.write("=== ГЛОБАЛЬНАЯ СТАТИСТИКА ===\n\n")
 
             f.write(f"1. Всего сообщений: {global_stats['total_messages']}\n\n")
@@ -419,7 +591,7 @@ class ChatAnalyzer:
             f.write("\n")
 
             f.write(
-                f"4. Самый активный день: {global_stats['active_day'][0]} ({global_stats['active_day'][1]} сообщений)\n\n")
+                f"4. Самый активный день (без фото и видео): {global_stats['active_day'][0]} ({global_stats['active_day'][1]} сообщений)\n\n")
 
             f.write(f"5. Дней без активности: {global_stats['inactive_days']}\n\n")
 
@@ -478,7 +650,8 @@ class ChatAnalyzer:
                 else:
                     f.write("3. Самый популярный стикер: Не найдено\n")
 
-                f.write(f"4. Самый активный день: {stats['active_day'][0]} ({stats['active_day'][1]} сообщений)\n")
+                f.write(
+                    f"4. Самый активный день (без фото и видео): {stats['active_day'][0]} ({stats['active_day'][1]} сообщений)\n")
 
                 f.write(f"5. Дней без активности: {stats['inactive_days']}\n")
 
@@ -574,6 +747,36 @@ class ChatAnalyzer:
             except ValueError:
                 print("Некорректный ID чата. Пожалуйста, введите целое число.")
 
+        # Запрашиваем период анализа
+        print("\nВведите период анализа (формат: день.месяц.год)")
+        print("Например: 1.1.2023 (для 1 января 2023 года)")
+        print("Оставьте пустым, чтобы проанализировать все сообщения")
+
+        start_input = input("Начальная дата (день.месяц.год): ").strip()
+        end_input = input("Конечная дата (день.месяц.год): ").strip()
+
+        if start_input:
+            try:
+                self.start_date = self.parse_date(start_input)
+            except ValueError as e:
+                print(f"Ошибка: {e}")
+                return
+        else:
+            self.start_date = None
+
+        if end_input:
+            try:
+                self.end_date = self.parse_date(end_input)
+                # Проверяем корректность диапазона
+                if self.start_date and self.end_date < self.start_date:
+                    print("Ошибка: конечная дата не может быть раньше начальной")
+                    return
+            except ValueError as e:
+                print(f"Ошибка: {e}")
+                return
+        else:
+            self.end_date = None
+
         # Проверяем доступ к чату
         try:
             await self.client.get_chat(self.chat_id)
@@ -606,9 +809,32 @@ class ChatAnalyzer:
 
         print(f"Анализ завершен. Результаты сохранены в {output_file}")
 
-    async def run_with_args(self, chat_id: int, db_path: str, output_file: str):
+    async def run_with_args(self, chat_id: int, start_date: str, end_date: str, db_path: str, output_file: str):
         """Запуск с аргументами командной строки"""
         await self.client.start()
+
+        # Парсим даты
+        if start_date:
+            try:
+                self.start_date = self.parse_date(start_date)
+            except ValueError as e:
+                print(f"Ошибка: {e}")
+                return
+        else:
+            self.start_date = None
+
+        if end_date:
+            try:
+                self.end_date = self.parse_date(end_date)
+                # Проверяем корректность диапазона
+                if self.start_date and self.end_date < self.start_date:
+                    print("Ошибка: конечная дата не может быть раньше начальной")
+                    return
+            except ValueError as e:
+                print(f"Ошибка: {e}")
+                return
+        else:
+            self.end_date = None
 
         # Проверяем доступ к чату
         try:
@@ -646,6 +872,8 @@ def main():
     load_dotenv(".env")
     parser = argparse.ArgumentParser(description="Telegram Chat Analyzer Userbot")
     parser.add_argument("--chat_id", type=int, help="ID чата для анализа")
+    parser.add_argument("--start_date", type=str, help="Начальная дата в формате день.месяц.год (например: 1.1.2023)")
+    parser.add_argument("--end_date", type=str, help="Конечная дата в формате день.месяц.год (например: 31.12.2023)")
     parser.add_argument("--db_path", type=str, default="chat_data.db", help="Путь к базе данных")
     parser.add_argument("--output", type=str, default="results.txt", help="Файл для вывода результатов")
 
@@ -666,7 +894,7 @@ def main():
     if not args.chat_id:
         asyncio.run(analyzer.run_interactive())
     else:
-        asyncio.run(analyzer.run_with_args(args.chat_id, args.db_path, args.output))
+        asyncio.run(analyzer.run_with_args(args.chat_id, args.start_date, args.end_date, args.db_path, args.output))
 
 
 if __name__ == "__main__":
